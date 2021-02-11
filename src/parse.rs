@@ -1,4 +1,3 @@
-use std;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::io;
@@ -12,16 +11,16 @@ use anyhow::Context;
 use anyhow::Error;
 use bitflags::bitflags;
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
+use positioned_io::Cursor;
+use positioned_io::ReadAt;
 
-use crc;
-
-use crate::assumption_failed;
 use crate::not_found;
 use crate::parse_error;
 use crate::read_le16;
 use crate::read_le32;
 use crate::unsupported_feature;
 use crate::Time;
+use crate::{assumption_failed, read_lei32};
 
 const EXT4_SUPER_MAGIC: u16 = 0xEF53;
 const INODE_BASE_LEN: usize = 128;
@@ -79,10 +78,10 @@ bitflags! {
 
 pub fn superblock<R>(mut reader: R, options: &crate::Options) -> Result<crate::SuperBlock<R>, Error>
 where
-    R: io::Read + io::Seek,
+    R: ReadAt,
 {
     let mut entire_superblock = [0u8; 1024];
-    reader.read_exact(&mut entire_superblock)?;
+    reader.read_exact_at(1024, &mut entire_superblock)?;
 
     let mut inner = io::Cursor::new(&mut entire_superblock[..]);
 
@@ -331,7 +330,8 @@ where
         block_size
     };
 
-    reader.seek(io::SeekFrom::Start(u64::from(group_table_pos)))?;
+    let mut grouper = Cursor::new(&mut reader);
+    grouper.seek(io::SeekFrom::Start(u64::from(group_table_pos)))?;
     let blocks_count = (u64::from(s_blocks_count_lo)
         + (u64::from(s_blocks_count_hi.unwrap_or(0)) << 32)
         - u64::from(s_first_data_block)
@@ -340,7 +340,7 @@ where
         / u64::from(s_blocks_per_group);
 
     let groups = crate::block_groups::BlockGroups::new(
-        &mut reader,
+        &mut grouper,
         blocks_count,
         s_desc_size,
         s_inodes_per_group,
@@ -388,9 +388,9 @@ where
     let i_mode = read_le16(&data[0x00..0x02]); /* File mode */
     let i_uid = read_le16(&data[0x02..0x04]); /* Low 16 bits of Owner Uid */
     let i_size_lo = read_le32(&data[0x04..0x08]); /* Size in bytes */
-    let i_atime = read_le32(&data[0x08..0x0C]); /* Access time */
-    let i_ctime = read_le32(&data[0x0C..0x10]); /* Inode Change time */
-    let i_mtime = read_le32(&data[0x10..0x14]); /* Modification time */
+    let i_atime = read_lei32(&data[0x08..0x0C]); /* Access time */
+    let i_ctime = read_lei32(&data[0x0C..0x10]); /* Inode Change time */
+    let i_mtime = read_lei32(&data[0x10..0x14]); /* Modification time */
     //    let i_dtime           = read_le32(&data[0x14..0x18]); /* Deletion Time */
     let i_gid = read_le16(&data[0x18..0x1A]); /* Low 16 bits of Group Id */
     let i_links_count = read_le16(&data[0x1A..0x1C]); /* Links count */
@@ -417,7 +417,7 @@ where
     } else {
         read_le16(&data[0x80..0x82])
     };
-    let inode_end = INODE_BASE_LEN + i_extra_isize as usize;
+    let inode_end = INODE_BASE_LEN + usize::try_from(i_extra_isize)?;
 
     ensure!(
         inode_end <= data.len(),
@@ -451,7 +451,7 @@ where
     let i_crtime = if i_extra_isize < 18 + 2 {
         None
     } else {
-        Some(read_le32(&data[0x90..0x94]))
+        Some(read_lei32(&data[0x90..0x94]))
     }; /* File Creation time */
     let i_crtime_extra = if i_extra_isize < 22 + 2 {
         None
@@ -522,22 +522,10 @@ where
         uid: u32::from(i_uid) | (u32::from(l_i_uid_high) << 16),
         gid: u32::from(i_gid) | (u32::from(l_i_gid_high) << 16),
         size: u64::from(i_size_lo) | (u64::from(i_size_high) << 32),
-        atime: Time {
-            epoch_secs: i_atime,
-            nanos: i_atime_extra,
-        },
-        ctime: Time {
-            epoch_secs: i_ctime,
-            nanos: i_ctime_extra,
-        },
-        mtime: Time {
-            epoch_secs: i_mtime,
-            nanos: i_mtime_extra,
-        },
-        btime: i_crtime.map(|epoch_secs| Time {
-            epoch_secs,
-            nanos: i_crtime_extra,
-        }),
+        atime: Time::from_extra(i_atime, i_atime_extra),
+        ctime: Time::from_extra(i_ctime, i_ctime_extra),
+        mtime: Time::from_extra(i_mtime, i_mtime_extra),
+        btime: i_crtime.map(|i_crtime| Time::from_extra(i_crtime, i_crtime_extra)),
         link_count: i_links_count,
         xattrs,
     };
@@ -628,7 +616,7 @@ fn read_xattrs(
         let e_value_size = read_le32(&reading[0x08..0x0C]);
         //        let e_hash              = read_le32(&reading[0x0C..0x10]);
 
-        let end_of_name = 0x10 + e_name_len as usize;
+        let end_of_name = 0x10 + usize::try_from(e_name_len)?;
 
         ensure!(
             reading.len() > end_of_name,
@@ -655,8 +643,8 @@ fn read_xattrs(
             std::str::from_utf8(name_suffix).with_context(|| anyhow!("name is invalid utf-8"))?
         );
 
-        let start = e_value_offset as usize;
-        let end = start + e_value_size as usize;
+        let start = usize::try_from(e_value_offset)?;
+        let end = start + usize::try_from(e_value_size)?;
 
         ensure!(
             start <= block_offset_start.len() && end <= block_offset_start.len(),

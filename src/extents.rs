@@ -3,6 +3,7 @@ use std::io;
 
 use anyhow::ensure;
 use anyhow::Error;
+use positioned_io::ReadAt;
 
 use crate::assumption_failed;
 use crate::read_le16;
@@ -26,36 +27,31 @@ pub struct TreeReader<R> {
 
 impl<R> TreeReader<R>
 where
-    R: io::Read + io::Seek,
+    R: ReadAt,
 {
     pub fn new(
-        mut inner: R,
+        inner: R,
         block_size: u32,
         size: u64,
         core: [u8; crate::INODE_CORE_SIZE],
         checksum_prefix: Option<u32>,
     ) -> Result<TreeReader<R>, Error> {
         let extents = load_extent_tree(
-            &mut |block| crate::load_disc_bytes(&mut inner, block_size, block),
+            &mut |block| crate::load_disc_bytes(&inner, block_size, block),
             core,
             checksum_prefix,
         )?;
-        TreeReader::create(inner, block_size, size, extents)
+        Ok(TreeReader::create(inner, block_size, size, extents))
     }
 
-    fn create(
-        inner: R,
-        block_size: u32,
-        size: u64,
-        extents: Vec<Extent>,
-    ) -> Result<TreeReader<R>, Error> {
-        Ok(TreeReader {
+    fn create(inner: R, block_size: u32, size: u64, extents: Vec<Extent>) -> TreeReader<R> {
+        TreeReader {
             pos: 0,
             len: size,
             inner,
             extents,
             block_size,
-        })
+        }
     }
 
     pub fn into_inner(self) -> R {
@@ -86,7 +82,7 @@ fn find_part(part: u32, extents: &[Extent]) -> FoundPart {
 
 impl<R> io::Read for TreeReader<R>
 where
-    R: io::Read + io::Seek,
+    R: ReadAt,
 {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {
@@ -106,10 +102,8 @@ where
                     (u64::from(extent.len) * block_size) - bytes_through_extent;
                 let to_read = std::cmp::min(remaining_bytes_in_extent, buf.len() as u64) as usize;
                 let to_read = std::cmp::min(to_read as u64, self.len - self.pos) as usize;
-                self.inner.seek(io::SeekFrom::Start(
-                    extent.start as u64 * block_size + bytes_through_extent,
-                ))?;
-                let read = self.inner.read(&mut buf[0..to_read])?;
+                let offset = extent.start * block_size + bytes_through_extent;
+                let read = self.inner.read_at(offset, &mut buf[0..to_read])?;
                 self.pos += u64::try_from(read).expect("infallible u64 conversion");
                 Ok(read)
             }
@@ -127,7 +121,7 @@ where
 
 impl<R> io::Seek for TreeReader<R>
 where
-    R: io::Read + io::Seek,
+    R: ReadAt,
 {
     fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
         match pos {
@@ -190,7 +184,7 @@ where
 
     if 0 == depth {
         for en in 0..extent_entries {
-            let raw_extent = &data[12 + en as usize * 12..];
+            let raw_extent = &data[12 + usize::from(en) * 12..];
             let ee_block = read_le32(raw_extent);
             let ee_len = read_le16(&raw_extent[4..]);
             let ee_start_hi = read_le16(&raw_extent[6..]);
@@ -208,7 +202,7 @@ where
     }
 
     for en in 0..extent_entries {
-        let extent_idx = &data[12 + en as usize * 12..];
+        let extent_idx = &data[12 + usize::from(en) * 12..];
         //            let ei_block = as_u32(extent_idx);
         let ei_leaf_lo = read_le32(&extent_idx[4..]);
         let ei_leaf_hi = read_le16(&extent_idx[8..]);
@@ -249,7 +243,7 @@ where
         assumption_failed(format!("initial depth too high: {}", depth))
     );
 
-    let mut extents = Vec::with_capacity(extent_entries as usize + depth as usize * 200);
+    let mut extents = Vec::with_capacity(usize::from(extent_entries) + usize::from(depth) * 200);
 
     add_found_extents(
         load_block,
@@ -272,7 +266,6 @@ fn zero(buf: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use std::convert::TryFrom;
-    use std::io;
     use std::io::Read;
 
     use crate::extents::Extent;
@@ -282,9 +275,8 @@ mod tests {
     fn simple_tree() {
         let data = (0..255u8).collect::<Vec<u8>>();
         let size = 4 + 4 * 2;
-        let all_bytes = io::Cursor::new(data);
         let mut reader = TreeReader::create(
-            all_bytes,
+            data,
             4,
             u64::try_from(size).expect("infallible u64 conversion"),
             vec![
@@ -299,8 +291,7 @@ mod tests {
                     len: 2,
                 },
             ],
-        )
-        .unwrap();
+        );
 
         let mut res = Vec::new();
         assert_eq!(size, reader.read_to_end(&mut res).unwrap());

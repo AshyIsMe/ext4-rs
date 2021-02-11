@@ -3,7 +3,6 @@ extern crate ext4;
 
 use std::convert::TryFrom;
 use std::fs;
-use std::io;
 use std::io::Read;
 use std::path;
 
@@ -17,7 +16,7 @@ fn all_types() {
             continue;
         }
 
-        let mut img = io::BufReader::new(fs::File::open(file.path()).unwrap());
+        let mut img = fs::File::open(file.path()).unwrap();
         for part in bootsector::list_partitions(&mut img, &bootsector::Options::default()).unwrap()
         {
             match part.attributes {
@@ -29,8 +28,8 @@ fn all_types() {
                 _ => panic!("unexpected partition table"),
             }
 
-            let mut part_reader = bootsector::open_partition(&mut img, &part).unwrap();
-            let mut superblock = ext4::SuperBlock::new(&mut part_reader).unwrap();
+            let part_reader = positioned_io::Slice::new(&mut img, part.first_byte, Some(part.len));
+            let superblock = ext4::SuperBlock::new(part_reader).unwrap();
             let root = superblock.root().unwrap();
             superblock
                 .walk(&root, &image_name, &mut |fs, path, inode, enhanced| {
@@ -62,8 +61,18 @@ fn all_types() {
                 .read_to_string(&mut s)
                 .unwrap();
             assert_eq!("Hello, world!\n", s);
+
+            assert_eq!(
+                11847456550,
+                superblock
+                    .load_inode(superblock.resolve_path("future-file").unwrap().inode)
+                    .unwrap()
+                    .stat
+                    .mtime
+                    .epoch_secs
+            );
         }
     }
 
-    assert_eq!(25 * 5, files_successfully_processed);
+    assert_eq!(28 * 5, files_successfully_processed);
 }

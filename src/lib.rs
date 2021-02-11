@@ -5,7 +5,7 @@ and files from them.
 # Example
 
 ```rust,no_run
-let mut block_device = std::io::BufReader::new(std::fs::File::open("/dev/sda1").unwrap());
+let mut block_device = std::fs::File::open("/dev/sda1").unwrap();
 let mut superblock = ext4::SuperBlock::new(&mut block_device).unwrap();
 let target_inode_number = superblock.resolve_path("/etc/passwd").unwrap().inode;
 let inode = superblock.load_inode(target_inode_number).unwrap();
@@ -29,6 +29,7 @@ use anyhow::Context;
 use anyhow::Error;
 use bitflags::bitflags;
 use byteorder::{LittleEndian, ReadBytesExt};
+use positioned_io::ReadAt;
 
 mod block_groups;
 mod extents;
@@ -211,8 +212,41 @@ pub struct SuperBlock<R> {
 /// A raw filesystem time.
 #[derive(Debug)]
 pub struct Time {
-    pub epoch_secs: u32,
+    pub epoch_secs: i64,
     pub nanos: Option<u32>,
+}
+
+impl Time {
+    // c.f. ext4_decode_extra_time
+    // "We use an encoding that preserves the times for extra epoch"
+    // the lower two bits of the extra field are added to the top of the sec field,
+    // the remainder are the nsec
+    pub fn from_extra(epoch_secs: i32, extra: Option<u32>) -> Time {
+        let mut epoch_secs = i64::from(epoch_secs);
+        match extra {
+            None => Time {
+                epoch_secs,
+                nanos: None,
+            },
+            Some(extra) => {
+                let epoch_bits = 2;
+
+                // 0b1100_00..0000
+                let epoch_mask = (1 << epoch_bits) - 1;
+
+                // 0b00..00_0011
+                let nsec_mask = !0u32 << epoch_bits;
+
+                epoch_secs += i64::from(extra & epoch_mask) << 32;
+
+                let nanos = (extra & nsec_mask) >> epoch_bits;
+                Time {
+                    epoch_secs,
+                    nanos: Some(nanos.clamp(0, 999_999_999)),
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -234,21 +268,20 @@ pub struct Options {
 
 impl<R> SuperBlock<R>
 where
-    R: io::Read + io::Seek,
+    R: ReadAt,
 {
     /// Open a filesystem, and load its superblock.
     pub fn new(inner: R) -> Result<SuperBlock<R>, Error> {
         SuperBlock::new_with_options(inner, &Options::default())
     }
 
-    pub fn new_with_options(mut inner: R, options: &Options) -> Result<SuperBlock<R>, Error> {
-        inner.seek(io::SeekFrom::Start(1024))?;
+    pub fn new_with_options(inner: R, options: &Options) -> Result<SuperBlock<R>, Error> {
         Ok(parse::superblock(inner, options)
             .with_context(|| anyhow!("failed to parse superblock"))?)
     }
 
     /// Load a filesystem entry by inode number.
-    pub fn load_inode(&mut self, inode: u32) -> Result<Inode, Error> {
+    pub fn load_inode(&self, inode: u32) -> Result<Inode, Error> {
         let data = self
             .load_inode_bytes(inode)
             .with_context(|| anyhow!("failed to find inode <{}> on disc", inode))?;
@@ -272,20 +305,19 @@ where
         })
     }
 
-    fn load_inode_bytes(&mut self, inode: u32) -> Result<Vec<u8>, Error> {
-        self.inner
-            .seek(io::SeekFrom::Start(self.groups.index_of(inode)?))?;
-        let mut data = vec![0u8; self.groups.inode_size as usize];
-        self.inner.read_exact(&mut data)?;
+    fn load_inode_bytes(&self, inode: u32) -> Result<Vec<u8>, Error> {
+        let offset = self.groups.index_of(inode)?;
+        let mut data = vec![0u8; usize::try_from(self.groups.inode_size)?];
+        self.inner.read_exact_at(offset, &mut data)?;
         Ok(data)
     }
 
-    fn load_disc_bytes(&mut self, block: u64) -> Result<Vec<u8>, Error> {
-        load_disc_bytes(&mut self.inner, self.groups.block_size, block)
+    fn load_disc_bytes(&self, block: u64) -> Result<Vec<u8>, Error> {
+        load_disc_bytes(&self.inner, self.groups.block_size, block)
     }
 
     /// Load the root node of the filesystem (typically `/`).
-    pub fn root(&mut self) -> Result<Inode, Error> {
+    pub fn root(&self) -> Result<Inode, Error> {
         Ok(self
             .load_inode(2)
             .with_context(|| anyhow!("failed to load root inode"))?)
@@ -294,11 +326,11 @@ where
     /// Visit every entry in the filesystem in an arbitrary order.
     /// The closure should return `true` if it wants walking to continue.
     /// The method returns `true` if the closure always returned true.
-    pub fn walk<F>(&mut self, inode: &Inode, path: &str, visit: &mut F) -> Result<bool, Error>
+    pub fn walk<F>(&self, inode: &Inode, path: &str, visit: &mut F) -> Result<bool, Error>
     where
-        F: FnMut(&mut Self, &str, &Inode, &Enhanced) -> Result<bool, Error>,
+        F: FnMut(&Self, &str, &Inode, &Enhanced) -> Result<bool, Error>,
     {
-        let enhanced = inode.enhance(&mut self.inner)?;
+        let enhanced = inode.enhance(&self.inner)?;
 
         if !visit(self, path, inode, &enhanced).with_context(|| anyhow!("user closure failed"))? {
             return Ok(false);
@@ -330,7 +362,7 @@ where
 
     /// Parse a path, and find the directory entry it represents.
     /// Note that "/foo/../bar" will be treated literally, not resolved to "/bar" then looked up.
-    pub fn resolve_path(&mut self, path: &str) -> Result<DirEntry, Error> {
+    pub fn resolve_path(&self, path: &str) -> Result<DirEntry, Error> {
         let path = path.trim_end_matches('/');
         if path.is_empty() {
             // this is a bit of a lie, but it works..?
@@ -357,7 +389,7 @@ where
         self.dir_entry_named(&curr, last)
     }
 
-    fn dir_entry_named(&mut self, inode: &Inode, name: &str) -> Result<DirEntry, Error> {
+    fn dir_entry_named(&self, inode: &Inode, name: &str) -> Result<DirEntry, Error> {
         if let Enhanced::Directory(entries) = self.enhance(inode)? {
             if let Some(en) = entries.into_iter().find(|entry| entry.name == name) {
                 Ok(en)
@@ -370,30 +402,30 @@ where
     }
 
     /// Read the data from an inode. You might not want to call this on thigns that aren't regular files.
-    pub fn open(&mut self, inode: &Inode) -> Result<TreeReader<&mut R>, Error> {
-        inode.reader(&mut self.inner)
+    pub fn open(&self, inode: &Inode) -> Result<TreeReader<&R>, Error> {
+        inode.reader(&self.inner)
     }
 
     /// Load extra metadata about some types of entries.
-    pub fn enhance(&mut self, inode: &Inode) -> Result<Enhanced, Error> {
-        inode.enhance(&mut self.inner)
+    pub fn enhance(&self, inode: &Inode) -> Result<Enhanced, Error> {
+        inode.enhance(&self.inner)
     }
 }
 
-fn load_disc_bytes<R>(mut inner: R, block_size: u32, block: u64) -> Result<Vec<u8>, Error>
+fn load_disc_bytes<R>(inner: R, block_size: u32, block: u64) -> Result<Vec<u8>, Error>
 where
-    R: io::Read + io::Seek,
+    R: ReadAt,
 {
-    inner.seek(io::SeekFrom::Start(block as u64 * u64::from(block_size)))?;
-    let mut data = vec![0u8; block_size as usize];
-    inner.read_exact(&mut data)?;
+    let offset = block * u64::from(block_size);
+    let mut data = vec![0u8; usize::try_from(block_size)?];
+    inner.read_exact_at(offset, &mut data)?;
     Ok(data)
 }
 
 impl Inode {
     fn reader<R>(&self, inner: R) -> Result<TreeReader<R>, Error>
     where
-        R: io::Read + io::Seek,
+        R: ReadAt,
     {
         Ok(TreeReader::new(
             inner,
@@ -407,7 +439,7 @@ impl Inode {
 
     fn enhance<R>(&self, inner: R) -> Result<Enhanced, Error>
     where
-        R: io::Read + io::Seek,
+        R: ReadAt,
     {
         Ok(match self.stat.extracted_type {
             FileType::RegularFile => Enhanced::RegularFile,
@@ -424,7 +456,7 @@ impl Inode {
                             self.flags
                         ))
                     );
-                    std::str::from_utf8(&self.core[0..self.stat.size as usize])
+                    std::str::from_utf8(&self.core[0..usize::try_from(self.stat.size)?])
                         .with_context(|| anyhow!("short symlink is invalid utf-8"))?
                         .to_string()
                 } else {
@@ -453,7 +485,7 @@ impl Inode {
 
     fn load_all<R>(&self, inner: R) -> Result<Vec<u8>, Error>
     where
-        R: io::Read + io::Seek,
+        R: ReadAt,
     {
         let size = usize::try_from(self.stat.size)?;
         let mut ret = vec![0u8; size];
@@ -465,7 +497,7 @@ impl Inode {
 
     fn read_directory<R>(&self, inner: R) -> Result<Vec<DirEntry>, Error>
     where
-        R: io::Read + io::Seek,
+        R: ReadAt,
     {
         let mut dirs = Vec::with_capacity(40);
 
@@ -500,7 +532,7 @@ impl Inode {
 
             let name_len = cursor.read_u8()?;
             let file_type = cursor.read_u8()?;
-            let mut name = vec![0u8; name_len as usize];
+            let mut name = vec![0u8; usize::try_from(name_len)?];
             cursor.read_exact(&mut name)?;
             if 0 != child_inode {
                 let name = std::str::from_utf8(&name)
@@ -539,7 +571,7 @@ impl Inode {
                 i64::from(rec_len) - i64::from(name_len) - 4 - 2 - 1 - 1,
             ))?;
 
-            read += rec_len as usize;
+            read += usize::try_from(rec_len)?;
             if read >= total_len {
                 ensure!(
                     read == total_len,
@@ -602,6 +634,12 @@ fn read_le16(from: &[u8]) -> u16 {
 fn read_le32(from: &[u8]) -> u32 {
     use byteorder::ByteOrder;
     LittleEndian::read_u32(from)
+}
+
+#[inline]
+fn read_lei32(from: &[u8]) -> i32 {
+    use byteorder::ByteOrder;
+    LittleEndian::read_i32(from)
 }
 
 fn parse_error(msg: String) -> Error {
