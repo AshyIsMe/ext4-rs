@@ -216,6 +216,18 @@ pub struct Time {
     pub nanos: Option<u32>,
 }
 
+/// rust nightly is not yet available on OpenBSD:
+/// https://github.com/rust-lang/rustup/issues/2168
+fn clamp(n: u32, min: u32, max: u32) -> u32 {
+    if n < min {
+        min
+    } else if n > max {
+        max
+    } else {
+        n
+    }
+}
+
 impl Time {
     // c.f. ext4_decode_extra_time
     // "We use an encoding that preserves the times for extra epoch"
@@ -242,7 +254,8 @@ impl Time {
                 let nanos = (extra & nsec_mask) >> epoch_bits;
                 Time {
                     epoch_secs,
-                    nanos: Some(nanos.clamp(0, 999_999_999)),
+                    // nanos: Some(nanos.clamp(0, 999_999_999)),
+                    nanos: Some(clamp(nanos, 0, 999_999_999)),
                 }
             }
         }
